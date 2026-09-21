@@ -1,0 +1,205 @@
+# Validation workflow for JBWS-4469 (SE 17 baseline / WSS4J 4.0.1 / OpenSAML 5.x).
+#
+# Runs three jobs in sequence:
+#   1. wildfly-snapshot-build  – builds the WildFly branch that carries the OpenSAML 5.x
+#                                upgrade (PR wildfly/wildfly#20296) and archives the SNAPSHOT
+#                                Maven repository as a reusable artifact.
+#   2. jbossws-cxf-testsuite   – extracts that repo, builds jbossws-cxf from JBWS-4469,
+#                                provisions a WildFly+jbossws-cxf overlay server, and runs
+#                                the full jbossws-cxf test suite against it.
+#   3. wildfly-ws-testsuite    – reuses both SNAPSHOT repos, patches version.org.jboss.ws.cxf
+#                                in the WildFly tree, rebuilds WildFly quickly, then runs
+#                                testsuite/integration/ws against the patched distribution.
+#
+# Trigger: manual only (workflow_dispatch).
+
+name: JBWS-4469 Integration Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      wildfly-repo:
+        description: 'WildFly repository (owner/repo)'
+        required: true
+        default: 'fabiobrz/wildfly'
+      wildfly-branch:
+        description: 'WildFly branch carrying the OpenSAML 5.x upgrade'
+        required: true
+        default: 'bump.opensaml.5'
+      jbossws-branch:
+        description: 'jbossws-cxf branch to validate'
+        required: true
+        default: 'JBWS-4469'
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Build WildFly snapshot
+  # ---------------------------------------------------------------------------
+  wildfly-snapshot-build:
+    uses: wildfly/wildfly/.github/workflows/shared-wildfly-build.yml@main
+    with:
+      wildfly-repo: ${{ inputs.wildfly-repo }}
+      wildfly-branch: ${{ inputs.wildfly-branch }}
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Build jbossws-cxf (JBWS-4469) and run its testsuite
+  # ---------------------------------------------------------------------------
+  jbossws-cxf-testsuite:
+    name: jbossws-cxf testsuite / JDK ${{ matrix.jdk-version }}
+    runs-on: ubuntu-latest
+    needs: wildfly-snapshot-build
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk-version: [17, 21]
+
+    steps:
+      - name: Checkout jbossws-cxf (${{ inputs.jbossws-branch }})
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.jbossws-branch }}
+
+      - name: Set up JDK ${{ matrix.jdk-version }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk-version }}
+          cache: maven
+
+      - name: Download WildFly SNAPSHOT Maven repository
+        uses: actions/download-artifact@v8
+        with:
+          name: wildfly-maven-repository
+          path: .
+
+      - name: Extract WildFly SNAPSHOT Maven repository
+        run: tar -xzf wildfly-maven-repository.tar.gz -C ~
+
+      # Build jbossws-cxf without tests first so its artifacts land in .m2;
+      # the dist module needs the feature-pack and channel manifest resolvable
+      # before provisioning.
+      - name: Build jbossws-cxf (skip tests)
+        run: |
+          mvn -B -s ./.m2-settings.xml -fae clean install \
+            -DskipTests \
+            -Pdist \
+            -Dwildfly.version=${{ needs.wildfly-snapshot-build.outputs.wildfly-version }}
+
+      # -Pdist,testsuite  – activates modules/dist (provisioning) and modules/testsuite.
+      # -Dwildfly.version – points Galleon at the WildFly SNAPSHOT built above.
+      # The dist module provisions wildfly-ee-galleon-pack + jbossws-cxf-feature-pack,
+      # overlaying the new jbossws-cxf modules onto the WildFly distribution.
+      - name: Run jbossws-cxf testsuite against WildFly ${{ needs.wildfly-snapshot-build.outputs.wildfly-version }}
+        run: |
+          mvn -B -s ./.m2-settings.xml -fae verify \
+            -Pdist,testsuite \
+            -Dwildfly.version=${{ needs.wildfly-snapshot-build.outputs.wildfly-version }} \
+            -Dexclude-udp-tests \
+            -Dexclude-ws-discovery-tests
+
+      - name: Upload surefire reports
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: jbossws-surefire-reports-jdk${{ matrix.jdk-version }}
+          path: '**/surefire-reports/'
+
+      - name: Upload server logs
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: jbossws-server-logs-jdk${{ matrix.jdk-version }}
+          path: '**/*.log'
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Run WildFly testsuite/integration/ws with patched jbossws-cxf version
+  # ---------------------------------------------------------------------------
+  wildfly-ws-testsuite:
+    name: WildFly WS testsuite / JDK ${{ matrix.jdk-version }}
+    runs-on: ubuntu-latest
+    needs: [wildfly-snapshot-build, jbossws-cxf-testsuite]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk-version: [17, 21]
+
+    steps:
+      - name: Set up JDK ${{ matrix.jdk-version }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk-version }}
+          cache: maven
+
+      - name: Download WildFly SNAPSHOT Maven repository
+        uses: actions/download-artifact@v8
+        with:
+          name: wildfly-maven-repository
+          path: .
+
+      - name: Extract WildFly SNAPSHOT Maven repository
+        run: tar -xzf wildfly-maven-repository.tar.gz -C ~
+
+      - name: Checkout WildFly (${{ inputs.wildfly-repo }}@${{ inputs.wildfly-branch }})
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.wildfly-repo }}
+          ref: ${{ inputs.wildfly-branch }}
+
+      # Resolve the jbossws-cxf SNAPSHOT version that was just built in job 2.
+      # It was installed into ~/.m2 by the jbossws-cxf-testsuite job — but that
+      # job ran in a separate runner, so we need to rebuild jbossws-cxf here too
+      # to install its artifacts into this runner's local Maven repo.
+      - name: Checkout jbossws-cxf (${{ inputs.jbossws-branch }}) for artifact installation
+        uses: actions/checkout@v7
+        with:
+          repository: jbossws/jbossws-cxf
+          ref: ${{ inputs.jbossws-branch }}
+          path: jbossws-cxf
+
+      - name: Install jbossws-cxf SNAPSHOT artifacts into local Maven repo
+        working-directory: jbossws-cxf
+        run: mvn -B -s ./.m2-settings.xml -fae clean install -DskipTests
+
+      # Determine the jbossws-cxf SNAPSHOT version and patch version.org.jboss.ws.cxf
+      # in the WildFly POM so the WS testsuite provisioning resolves the new feature-pack.
+      - name: Patch version.org.jboss.ws.cxf in WildFly POM
+        working-directory: jbossws-cxf
+        run: |
+          JBOSSWS_VERSION=$(mvn -B help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "Patching WildFly POM: version.org.jboss.ws.cxf → ${JBOSSWS_VERSION}"
+          cd ..
+          mvn -B versions:set-property \
+            -Dproperty=version.org.jboss.ws.cxf \
+            -DnewVersion=${JBOSSWS_VERSION} \
+            -DgenerateBackupPoms=false
+
+      # Quick WildFly build (no tests) to produce the distribution that the WS
+      # testsuite will copy into its target directory.
+      - name: Build WildFly quickly (skip tests)
+        run: mvn -B clean install -DskipTests -Dcheckstyle.skip=true -Denforcer.skip=true
+
+      # Run only the WS integration testsuite.  --also-make ensures all parent
+      # aggregator POMs and shared modules are built before the ws submodule.
+      - name: Run WildFly testsuite/integration/ws
+        run: |
+          mvn -B test \
+            -pl testsuite/integration/ws \
+            --also-make
+
+      - name: Upload surefire reports
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: wildfly-ws-surefire-reports-jdk${{ matrix.jdk-version }}
+          path: '**/surefire-reports/'
+
+      - name: Upload server logs
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: wildfly-ws-server-logs-jdk${{ matrix.jdk-version }}
+          path: '**/*.log'
